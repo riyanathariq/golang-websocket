@@ -4,19 +4,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/gorilla/websocket"
-	"io"
 	"net/http"
+	"sync"
 )
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Izinkan semua origin (ubah sesuai kebutuhan)
+		return true // Izinkan semua origin (sesuaikan kebutuhan)
 	},
 }
 
-var clients = make(map[*websocket.Conn]bool) // Simpan semua client yang terhubung
+// Map untuk menyimpan koneksi berdasarkan user_id
+var clients = make(map[string]*websocket.Conn)
+var mu sync.Mutex // Untuk menjaga concurrency
 
+// Struktur JSON untuk menerima pesan
+type MessageRequest struct {
+	UserID  string `json:"user_id"` // Target penerima
+	Message string `json:"message"` // Isi pesan
+}
+
+// WebSocket handler untuk user tertentu
 func handleConnection(w http.ResponseWriter, r *http.Request) {
+	// Ambil user_id dari query parameter
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		http.Error(w, "user_id is required", http.StatusBadRequest)
+		return
+	}
+
+	// Upgrade koneksi HTTP ke WebSocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		fmt.Println("Error upgrading:", err)
@@ -24,68 +41,62 @@ func handleConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	clients[conn] = true
-	fmt.Println("Client connected")
+	// Simpan koneksi ke dalam map
+	mu.Lock()
+	clients[userID] = conn
+	mu.Unlock()
 
-	// Loop untuk membaca pesan dari client (opsional)
+	fmt.Printf("User %s connected\n", userID)
+
+	// Loop untuk menangani pesan masuk
 	for {
 		_, _, err := conn.ReadMessage()
 		if err != nil {
-			fmt.Println("Client disconnected:", err)
-			delete(clients, conn)
+			fmt.Println("User disconnected:", userID)
+			mu.Lock()
+			delete(clients, userID)
+			mu.Unlock()
 			break
 		}
 	}
 }
 
-type MessageRequest struct {
-	Message string `json:"message"`
-}
-
-func broadcastMessages(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
-		return
-	}
-	defer r.Body.Close()
-
+// API untuk mengirim pesan ke user tertentu
+func sendMessage(w http.ResponseWriter, r *http.Request) {
 	var req MessageRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON format", http.StatusBadRequest)
 		return
 	}
 
-	// Pastikan message tidak kosong
-	if req.Message == "" {
-		http.Error(w, "Message cannot be empty", http.StatusBadRequest)
+	// Cari koneksi WebSocket berdasarkan user_id
+	mu.Lock()
+	conn, exists := clients[req.UserID]
+	mu.Unlock()
+
+	if !exists {
+		http.Error(w, "User not connected", http.StatusNotFound)
 		return
 	}
 
-	// Broadcast notifikasi ke semua WebSocket client
-	broadcastNotification(req.Message)
-
-	// Beri respon sukses
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Message broadcasted successfully"))
-}
-
-// Fungsi untuk broadcast notifikasi ke semua client
-func broadcastNotification(message string) {
-	for conn := range clients {
-		err := conn.WriteMessage(websocket.TextMessage, []byte(message))
-		if err != nil {
-			fmt.Println("Error sending message:", err)
-			conn.Close()
-			delete(clients, conn)
-		}
+	// Kirim pesan ke user tertentu
+	err := conn.WriteMessage(websocket.TextMessage, []byte(req.Message))
+	if err != nil {
+		fmt.Println("Error sending message:", err)
+		mu.Lock()
+		delete(clients, req.UserID)
+		mu.Unlock()
+		http.Error(w, "Failed to send message", http.StatusInternalServerError)
+		return
 	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Message sent successfully"))
 }
 
 func main() {
-	http.HandleFunc("/ws", handleConnection)
-
-	http.HandleFunc("/bc", broadcastMessages)
+	http.HandleFunc("/ws", handleConnection) // WebSocket endpoint
+	http.HandleFunc("/bc", sendMessage)      // API untuk kirim pesan
 
 	fmt.Println("WebSocket server running on :8080")
 	http.ListenAndServe(":8080", nil)
